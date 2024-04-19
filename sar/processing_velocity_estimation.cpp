@@ -51,8 +51,8 @@ double CalcDistance(OrbitStateVector pos, GeoPos3D xyz) {
 
 double EstimateVrAtRange(const SARMetadata& metadata, int az_idx, int range_idx) {
     double R0 = metadata.slant_range_first_sample + range_idx * metadata.range_spacing;
-    const int aperture_size = CalcAperturePixels(metadata, range_idx) / 3;
-    const int N = 9;
+    const int aperture_size = CalcAperturePixels(metadata, range_idx) / 2;
+    const int N = 20;
 
     auto center_osv = InterpolateOrbit(metadata.orbit_state_vectors, CalcAzimuthTime(metadata, az_idx));
 

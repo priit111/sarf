@@ -140,9 +140,24 @@ SARImage RangeDopplerAlgorithm(const SARMetadata& metadata, SARImage& in)
     int azimuth_sz = in.YStride();
     int azimuth_fft_size = in.YStride();
 
+#if 1
     auto fft_forward = TimeStart();
     RunAzimuthFFT((fftwf_complex*)data_in, range_sz, range_stride, azimuth_sz, true);
     TimeStop(fft_forward, "forward Azimuth FFT");
+#else
+    auto fft_forward = TimeStart();
+    std::unique_ptr<IQ<float>[]> tmp_buf(new IQ<float>[range_stride * azimuth_fft_size]);
+    Transpose(data_in, tmp_buf.get(), range_stride, azimuth_fft_size);
+    TimeStop(fft_forward, "First transpose");
+    fft_forward = TimeStart();
+    RunRangeFFT(tmp_buf.get(), azimuth_fft_size, range_sz, true);
+    TimeStop(fft_forward, "transposed Azimuth FFT");
+    fft_forward = TimeStart();
+    Transpose(tmp_buf.get(), data_in, azimuth_fft_size, range_stride);
+    TimeStop(fft_forward, "Second transpose");
+
+#endif
+
 
     SARImage out;
     out.Init(range_sz, in.YSize(), range_stride, azimuth_sz);

@@ -45,3 +45,24 @@ inline void WriteOut(const char* path, SARImage& img)
     GDALClose(ds);
     printf("file = %s done!\n", path);
 }
+
+inline void WriteOut(const char* path, float* data, int w, int h, double* gt)
+{
+    GDALRegister_GTiff();
+
+    auto ds = GetGDALDriverManager()->GetDriverByName("gtiff")->Create(path, w, h, 1, GDT_Float32, nullptr);
+    auto b = ds->GetRasterBand(1);
+    ds->SetGeoTransform(gt);
+
+    OGRSpatialReference target_crs;
+    // EPSG:4326 is a WGS84 code
+    target_crs.importFromEPSG(4326);
+    char* projection_wkt = nullptr;
+    target_crs.exportToWkt(&projection_wkt);
+    ds->SetProjection(projection_wkt);
+
+    b->RasterIO(GF_Write, 0, 0, w, h, data, w, h, GDT_Float32, 0, 0);
+    GDALClose(ds);
+    printf("file = %s done!\n", path);
+}
+

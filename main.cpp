@@ -37,6 +37,7 @@
 #include "sar/processing_velocity_estimation.h"
 #include "sar/range_compression.hpp"
 #include "sar/range_doppler_algorithm.hpp"
+#include "sar/terrain_correction.hpp"
 
 void PlotChirp(const std::vector<std::complex<float>>& chirp) {
     PlotArgs a = {};
@@ -65,6 +66,7 @@ int main(int argc, const char* argv[]) {
     auto t = TimeStart();
     fftwf_init_threads();
     fftwf_plan_with_nthreads(std::thread::hardware_concurrency());
+
 
     if (argc != 2) {
         return 1;
@@ -131,16 +133,19 @@ int main(int argc, const char* argv[]) {
     TimeStop(rc_time, "Range compression");
 
     WriteOut("/tmp/rc.tiff", data);
-
-    // metadata.results.Vr = 7157.87;
+    
 
     auto az_start = TimeStart();
     auto az = RangeDopplerAlgorithm(metadata, data);
     TimeStop(az_start, "Azimuth compression");
 
+    data.Clear();
+
     WriteOut("/tmp/az.tiff", az);
 
     TimeStop(t, "Total");
+
+    RangeDopplerTerrainCorrection(az, metadata);
 
     return 0;
 }

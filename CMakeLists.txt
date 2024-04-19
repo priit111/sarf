@@ -26,6 +26,7 @@ set(PALSAR_SOURCES
         sar/range_compression.cpp
         sar/fractional_doppler_centroid.cpp
         sar/processing_velocity_estimation.cpp
+        sar/terrain_correction.cpp
 
 
         )
@@ -45,4 +46,4 @@ find_package (Eigen3)
 
 target_include_directories(sarf PRIVATE ./)
 
-target_link_libraries(sarf PRIVATE fmt::fmt gdal fftw3f pthread fftw3f_threads Eigen3::Eigen)
+target_link_libraries(sarf PRIVATE fmt::fmt gdal fftw3f pthread fftw3f_threads fftw3 Eigen3::Eigen)

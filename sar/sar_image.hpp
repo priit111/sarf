@@ -47,6 +47,15 @@ public:
 
     const IQ<float>* Get() const { return data_.get(); }
 
+    void Clear()
+    {
+        x_size_ = 0;
+        y_size_ = 0;
+        x_stride_ = 0;
+        y_stride_ = 0;
+        data_.reset();
+    }
+
 private:
     std::unique_ptr<IQ<float>[]> data_;
     int x_size_;

@@ -1,16 +1,15 @@
 #include "terrain_correction.hpp"
 
 #include <algorithm>
-#include <thread>
 #include <atomic>
+#include <thread>
 #include <vector>
 
 #include "fmt/format.h"
 
 #include "util/geo_tools.hpp"
-#include "util/util.hpp"
 #include "util/img_out.hpp"
-
+#include "util/util.hpp"
 
 namespace {
 struct Vec3d {
@@ -18,14 +17,14 @@ struct Vec3d {
     double y;
     double z;
 };
-double getDopplerFrequency(Vec3d earthPoint, Vec3d sensorPosition, Vec3d sensorVelocity, double wavelength) {
-    const auto xDiff = earthPoint.x - sensorPosition.x;
-    const auto yDiff = earthPoint.y - sensorPosition.y;
-    const auto zDiff = earthPoint.z - sensorPosition.z;
-    const auto distance = sqrt(xDiff * xDiff + yDiff * yDiff + zDiff * zDiff);
 
-    return 2.0 * (sensorVelocity.x * xDiff + sensorVelocity.y * yDiff + sensorVelocity.z * zDiff) /
-           (distance * wavelength);
+double CalcDopplerFrequency(GeoPos3D earth_point, GeoPos3D sensor_pos, Velocity3D sensor_vel, double wavelength) {
+    const auto dx = earth_point.x - sensor_pos.x;
+    const auto dy = earth_point.y - sensor_pos.y;
+    const auto dz = earth_point.z - sensor_pos.z;
+    const auto distance = sqrt(dx * dx + dy * dy + dz * dz);
+
+    return 2.0 * (sensor_vel.x * dx + sensor_vel.y * dy + sensor_vel.z * dz) / (distance * wavelength);
 }
 
 struct Args {
@@ -41,28 +40,27 @@ struct Args {
     int in_azimuth_size;
     const OrbitStateVector* osv;
     int n_osv;
-    const Vec3d* sat_pos_az;
-    const Vec3d* sat_vel_az;
+    const GeoPos3D* sat_pos_az;
+    const Velocity3D* sat_vel_az;
 };
 
-inline double GetEarthPointZeroDopplerTime(double line_time_interval, double wavelength, Vec3d earth_point,
-                                               int n_azimuth, const Vec3d* sensor_position,
-                                               const Vec3d* sensor_velocity) {
-    const double first_line_utc = 0.0;
+constexpr double INVALID_AZ_TIME = -1234567e7;
+double GetEarthPointZeroDopplerTime(double line_time_interval, double wavelength, GeoPos3D earth_point, int n_azimuth,
+                                    const GeoPos3D* sensor_position, const Velocity3D* sensor_velocity) {
     // binary search is used in finding the zero doppler time
     int lower_bound = 0;
     int upper_bound = n_azimuth - 1;
     auto lower_bound_freq =
-        getDopplerFrequency(earth_point, sensor_position[lower_bound], sensor_velocity[lower_bound], wavelength);
+        CalcDopplerFrequency(earth_point, sensor_position[lower_bound], sensor_velocity[lower_bound], wavelength);
     auto upper_bound_freq =
-        getDopplerFrequency(earth_point, sensor_position[upper_bound], sensor_velocity[upper_bound], wavelength);
+        CalcDopplerFrequency(earth_point, sensor_position[upper_bound], sensor_velocity[upper_bound], wavelength);
 
     if (std::abs(lower_bound_freq) < 1.0) {
-        return first_line_utc + lower_bound * line_time_interval;
+        return lower_bound * line_time_interval;
     } else if (std::abs(upper_bound_freq) < 1.0) {
-        return first_line_utc + upper_bound * line_time_interval;
+        return upper_bound * line_time_interval;
     } else if (lower_bound_freq * upper_bound_freq > 0.0) {
-        return NAN;
+        return INVALID_AZ_TIME;
     }
 
     // start binary search
@@ -80,27 +78,35 @@ inline double GetEarthPointZeroDopplerTime(double line_time_interval, double wav
             upper_bound = mid;
             upper_bound_freq = mid_freq;
         } else if (mid_freq == 0.0) {
-            return first_line_utc + mid * line_time_interval;
+            return mid * line_time_interval;
         }
     }
 
     const auto y0 =
         lower_bound - lower_bound_freq * (upper_bound - lower_bound) / (upper_bound_freq - lower_bound_freq);
-    return first_line_utc + y0 * line_time_interval;
+    return y0 * line_time_interval;
 }
 
-inline Vec3d GetPosition(double time, const OrbitStateVector* vectors, int n_osv) {
+[[maybe_unused]] Vec3d GetPosition(double time, const OrbitStateVector* vectors, int n_osv) {
     int i0 = 0;
     int iN = n_osv - 1;
+    if(iN > 8)
+    {
+        double t_first =vectors[0].time;
+        i0 = std::max<int>(0, (time - t_first) - 4);
+        iN = std::min(iN, i0 + 8);
+        //fmt::print("t = {} i0 iN = {} {}\n", time, i0, iN);
+    }
 
     Vec3d result{0, 0, 0};
-    for (int i = 0; i <= n_osv; ++i) {
+    for (int i = i0; i <= iN; ++i) {
         auto const orbI = vectors[i];
 
         double weight = 1;
         for (int j = i0; j <= iN; ++j) {
             if (j != i) {
                 double const time2 = vectors[j].time;
+
                 weight *= (time - time2) / (orbI.time - time2);
             }
         }
@@ -111,57 +117,57 @@ inline Vec3d GetPosition(double time, const OrbitStateVector* vectors, int n_osv
     return result;
 }
 
-
-bool myIsnan(double v) {
-    std::uint64_t i;
-    memcpy(&i, &v, 8);
-    return ((i&0x7ff0000000000000)==0x7ff0000000000000)&&(i&0xfffffffffffff);
-}
-
-void RunTC(const IQ<float>* in, float* out, int out_x_size, int y_start, int y_end, int in_range_size, int in_range_stride, Args args) {
+void RunTC(const IQ<float>* in, float* out, int out_x_size, int y_start, int y_end, int in_range_size,
+           int in_range_stride, Args args) {
     for (int y = y_start; y < y_end; y++) {
         for (int x = 0; x < out_x_size; x++) {
-
             const double lat = args.lat_start + y * args.pixel_spacing_y + 0.5 * args.pixel_spacing_y;
             const double lon = args.lon_start + x * args.pixel_spacing_x + 0.5 * args.pixel_spacing_x;
-            auto tmp = Geo2xyzWgs84(lat, lon, 0);
-            Vec3d earth_point = {.x = tmp.x, .y = tmp.y, .z =tmp.z};
-            double az_time =
-                GetEarthPointZeroDopplerTime(args.line_time_interval, args.wavelength, earth_point,
-                                                 args.in_azimuth_size, args.sat_pos_az, args.sat_vel_az);
+            const double latitude = 0;  // TODO dem
+            auto earth_point = Geo2xyzWgs84(lat, lon, latitude);
+            double az_time = GetEarthPointZeroDopplerTime(args.line_time_interval, args.wavelength, earth_point,
+                                                          args.in_azimuth_size, args.sat_pos_az, args.sat_vel_az);
             const int out_idx = x + y * out_x_size;
-            if(myIsnan(az_time))
-            {
+            if (az_time == INVALID_AZ_TIME) {
                 out[out_idx] = 0.0f;
                 continue;
             }
-            double az_idx = az_time / args.line_time_interval;
+            const double az_idx = az_time / args.line_time_interval;
 
-            if (az_idx < 0.0 || az_idx >= args.in_azimuth_size) {
+            if (az_idx < 0.0 || az_idx >= args.in_azimuth_size - 1) {
                 out[out_idx] = 0.0f;
                 continue;
             }
 
             // slant range
-
-
-            //Vec3d sat_pos = GetPosition(az_time, args.osv, args.n_osv);
-
-            Vec3d sat_pos = args.sat_pos_az[static_cast<int>(std::round(az_idx))];
-
+#if 0
+            // SNAP interpolate OSV for each point
+            Vec3d sat_pos = GetPosition(az_time, args.osv, args.n_osv);
+#else
+            // linearly interpolate between precalculated positions? Faster with almost no precision loss?
+            // TODO investigate
+            double interp_dt = az_idx - std::round(az_idx);
+            int az_idx_i = static_cast<int>(az_idx);
+            auto pos0 = args.sat_pos_az[az_idx_i];
+            auto pos1 = args.sat_pos_az[az_idx_i + 1];
+            GeoPos3D sat_pos = {};
+            sat_pos.x = pos0.x + interp_dt * (pos1.x - pos0.x);
+            sat_pos.y = pos0.y + interp_dt * (pos1.y - pos0.y);
+            sat_pos.z = pos0.z + interp_dt * (pos1.z - pos0.z);
+#endif
             // range idx
             double dx = earth_point.x - sat_pos.x;
             double dy = earth_point.y - sat_pos.y;
             double dz = earth_point.z - sat_pos.z;
             double slant_range = sqrt(dx * dx + dy * dy + dz * dz);
             double rg_idx = (slant_range - args.slant_range_first_sample) / args.range_spacing;
-
-            if(rg_idx < 0 || rg_idx >= in_range_size)
-            {
+            //fmt::print("az time = {} rg idx = {} slr = {}\n", az_time, rg_idx, slant_range);
+            if (rg_idx < 0 || rg_idx >= in_range_size) {
                 out[out_idx] = 0.0f;
                 continue;
             }
 
+            // bilinear interpolation based on the range and azimuth index... for now
             int x_i = (int)rg_idx;
             int y_i = (int)az_idx;
 
@@ -170,8 +176,8 @@ void RunTC(const IQ<float>* in, float* out, int out_x_size, int y_start, int y_e
             float val2 = ToIntens(in[(y_i + 1) * in_range_stride + x_i]);
             float val3 = ToIntens(in[(y_i + 1) * in_range_stride + x_i + 1]);
 
-            float interp_x = (float)rg_idx - x_i;
-            float interp_y = (float)az_idx - y_i;
+            float interp_x = static_cast<float>(rg_idx) - x_i;
+            float interp_y = static_cast<float>(az_idx) - y_i;
 
             float int_r0 = val0 + interp_x * (val1 - val0);
             float int_r1 = val2 + interp_x * (val3 - val2);
@@ -203,7 +209,8 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
     fmt::print("geobox = {} {} {} {}\n", lat_max, lat_min, lon_max, lon_min);
 
     fmt::print("az spacing = {} rg spacing = {}\n", metadata.azimuth_spacing, metadata.range_spacing);
-    double pixel_spacing_in_meter = std::max({metadata.azimuth_spacing, metadata.range_spacing, 1.0});
+    constexpr double custom_spacing = 1.0;
+    double pixel_spacing_in_meter = std::max({metadata.azimuth_spacing, metadata.range_spacing, custom_spacing});
     double pixel_spacing_in_degree = pixel_spacing_in_meter / WGS84::A * (180.0 / M_PI);
     double dif_lat = std::fabs(lat_max - lat_min);
     double dif_lon = std::fabs(lon_max - lon_min);
@@ -215,7 +222,6 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
     fmt::print("Terrain correction output dimensions = {} {}, pixel spacing = {} m\n", x_size, y_size,
                pixel_spacing_in_meter);
 
-
     float* out = new float[total];
     fmt::print("out allocated...\n");
     Args args = {};
@@ -224,10 +230,9 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
     args.pixel_spacing_x = pixel_spacing_in_degree;
     args.pixel_spacing_y = -pixel_spacing_in_degree;
 
-    std::vector<Vec3d> pos;
-    std::vector<Vec3d> vel;
-    for(int i = 0; i < azimuth_size; i++)
-    {
+    std::vector<GeoPos3D> pos;
+    std::vector<Velocity3D> vel;
+    for (int i = 0; i < azimuth_size; i++) {
         auto osv = InterpolateOrbit(metadata.orbit_state_vectors, CalcAzimuthTime(metadata, i));
         pos.push_back({osv.x_pos, osv.y_pos, osv.z_pos});
         vel.push_back({osv.x_vel, osv.y_vel, osv.z_vel});
@@ -237,13 +242,14 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
 
     osv.clear();
 
-    for(auto& e : metadata.orbit_state_vectors)
+    double last_line_time = CalcAzimuthTime(metadata, azimuth_size - 1);
+    for(double t = -5.0; t < last_line_time + 5.0; t += 1.0)
     {
-        if(e.time >= -180 || e.time <= 180)
-        {
-            osv.push_back(e);
-        }
+        auto iosv = InterpolateOrbit(metadata.orbit_state_vectors, t);
+        osv.push_back(iosv);
     }
+
+    fmt::print("osv = {}\n", osv.size());
 
     args.line_time_interval = metadata.line_time_interval;
     args.wavelength = metadata.wavelength;
@@ -256,14 +262,13 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
     args.in_azimuth_size = azimuth_size;
 
     auto tc_start = TimeStart();
-    const int n_threads =  std::thread::hardware_concurrency();
+    const int n_threads = std::thread::hardware_concurrency();
     fmt::print("TC N THREADS = {}\n", n_threads);
     std::vector<std::thread> thread_vec;
     uint32_t y_step = (y_size / n_threads) + 1;
 
     int start_y = 0;
-    for(int i = 0; i < n_threads; i++)
-    {
+    for (int i = 0; i < n_threads; i++) {
         start_y = i * y_step;
         int end_y = start_y + y_step;
         end_y = std::min(end_y, y_size);
@@ -272,9 +277,7 @@ void RangeDopplerTerrainCorrection(const SARImage& img, const SARMetadata& metad
         thread_vec.push_back(std::move(t));
     }
 
-
-    for(auto& t : thread_vec)
-    {
+    for (auto& t : thread_vec) {
         t.join();
     }
 
